@@ -2,7 +2,7 @@
 
 Includes:
 - Compass Search (pattern search along coordinate directions, ideal for non-smooth/noisy objective functions)
-  with optional adaptive stochastic error control (`errorcontrol=True`).
+  with optional on-demand stochastic error control (`errorcontrol=True`).
 - SciPy-based optimizers (L-BFGS-B, Nelder-Mead, Powell)
 """
 
@@ -39,135 +39,120 @@ class OptimizerResult:
 
 
 class AveragedFunction:
-    """Manages adaptive stochastic evaluation and hypothesis testing for noisy objectives.
+    """Manages stochastic function evaluations with strictly on-demand sample expansion.
 
-    Inspired by the error-control mechanism of noisyopt, this class adaptively averages
-    repeated stochastic evaluations (or mini-batches) and uses paired/two-sample Student's
-    t-tests to confirm statistically significant descent directions.
+    Unlike naive error-control that raises sample size N globally across all points,
+    this class expands N incrementally ONLY when a specific comparison between candidate
+    and current point is inconclusive (i.e. mean difference indicates descent, but
+    statistical power is insufficient to confirm significance at level alpha).
+
+    Baseline sample size (n_init) is preserved so that unambiguous steps take minimal evaluations.
     """
 
     def __init__(
         self,
         func: Callable[..., float],
-        N: int = 10,
+        n_init: int = 8,
+        max_n: int = 60,
         paired: bool = True,
-        max_N: int = 200,
         random_state: int = 42,
     ):
         self.func = func
-        self._N = max(2, int(N))
+        self.n_init = max(2, int(n_init))
+        self.max_n = max(self.n_init, int(max_n))
         self.paired = paired
-        self.max_N = max_N
         self.cache: Dict[Tuple[float, ...], List[float]] = {}
         self.nev = 0
         rng = np.random.default_rng(random_state)
-        self.seeds = list(rng.integers(0, 2**31 - 1, size=max_N))
+        # Sufficient pool of shared paired seeds
+        self.seeds = list(rng.integers(0, 2**31 - 1, size=max_n * 4))
 
-    @property
-    def N(self) -> int:
-        return self._N
-
-    @N.setter
-    def N(self, value: Union[int, float]):
-        self._N = min(max(2, int(value)), self.max_N)
-
-    def _call_func(self, pt: np.ndarray, seed: int) -> float:
-        try:
-            val = float(self.func(pt, seed=seed))
-        except TypeError:
-            try:
-                val = float(self.func(pt))
-            except Exception:
-                val = 1e12
-        return val if np.isfinite(val) else 1e12
-
-    def __call__(self, x: np.ndarray) -> Tuple[float, float]:
-        key = tuple(np.round(x, decimals=8))
+    def _ensure_samples(self, pt: np.ndarray, target_n: int) -> None:
+        key = tuple(np.round(pt, decimals=8))
         if key not in self.cache:
             self.cache[key] = []
-
-        curr_list = self.cache[key]
-        n_curr = len(curr_list)
-        if n_curr < self._N:
-            needed = self._N - n_curr
+        curr = self.cache[key]
+        n_curr = len(curr)
+        if n_curr < target_n:
+            needed = target_n - n_curr
             for i in range(needed):
-                seed = int(self.seeds[n_curr + i])
-                val = self._call_func(x, seed)
-                curr_list.append(val)
+                seed = int(self.seeds[(n_curr + i) % len(self.seeds)])
+                try:
+                    val = float(self.func(pt, seed=seed))
+                except TypeError:
+                    try:
+                        val = float(self.func(pt))
+                    except Exception:
+                        val = 1e12
+                val = val if np.isfinite(val) else 1e12
+                curr.append(val)
                 self.nev += 1
 
-        arr = np.array(curr_list[: self._N], dtype=np.float64)
-        mean_val = float(np.mean(arr))
-        se_val = float(np.std(arr, ddof=1) / np.sqrt(self._N)) if self._N > 1 else 0.0
+    def evaluate(self, pt: np.ndarray, n_samples: Optional[int] = None) -> Tuple[float, float]:
+        """Return (mean, standard_error) for pt using at least n_samples."""
+        n = n_samples or self.n_init
+        self._ensure_samples(pt, n)
+        key = tuple(np.round(pt, decimals=8))
+        vals = np.array(self.cache[key][:n], dtype=np.float64)
+        mean_val = float(np.mean(vals))
+        se_val = float(np.std(vals, ddof=1) / np.sqrt(n)) if n > 1 else 0.0
         return mean_val, se_val
 
-    def mean_only(self, x: np.ndarray) -> float:
-        return self(x)[0]
-
-    def diffse(self, x1: np.ndarray, x2: np.ndarray) -> float:
-        """Standard error of difference between function evaluations at x1 and x2."""
-        self(x1)
-        self(x2)
-        key1 = tuple(np.round(x1, decimals=8))
-        key2 = tuple(np.round(x2, decimals=8))
-        v1 = np.array(self.cache[key1][: self._N], dtype=np.float64)
-        v2 = np.array(self.cache[key2][: self._N], dtype=np.float64)
-        if self.paired and len(v1) == len(v2) and self._N > 1:
-            diff = v1 - v2
-            std_diff = np.std(diff, ddof=1)
-            return float(std_diff / np.sqrt(self._N))
-        else:
-            s1 = np.var(v1, ddof=1) if len(v1) > 1 else 0.0
-            s2 = np.var(v2, ddof=1) if len(v2) > 1 else 0.0
-            return float(np.sqrt(s1 / len(v1) + s2 / len(v2)))
-
-    def test(
+    def compare_candidates(
         self,
         xtest: np.ndarray,
         x: np.ndarray,
-        type_: str = "smaller",
         alpha: float = 0.05,
+        step_n: int = 4,
     ) -> bool:
-        """Hypothesis testing comparing xtest against x."""
-        self(xtest)
-        self(x)
-        key_t = tuple(np.round(xtest, decimals=8))
-        key_x = tuple(np.round(x, decimals=8))
-        vt = np.array(self.cache[key_t][: self._N], dtype=np.float64)
-        vx = np.array(self.cache[key_x][: self._N], dtype=np.float64)
+        """Test if xtest is statistically significantly smaller than x.
 
-        diff = vt - vx
-        mean_diff = float(np.mean(diff))
+        Increases N incrementally ONLY for this specific candidate pair when inconclusive.
+        Never inflates the global baseline sample size for future candidates.
+        """
+        curr_n = self.n_init
 
-        if abs(mean_diff) < 1e-12:
-            return type_ == "equality"
+        while True:
+            self._ensure_samples(xtest, curr_n)
+            self._ensure_samples(x, curr_n)
 
-        if self.paired and self._N > 1:
-            diff_std = np.std(diff, ddof=1)
-            if diff_std < 1e-12:
-                # Virtually identical
-                stat = float("-inf" if mean_diff < 0 else "inf")
+            key_t = tuple(np.round(xtest, decimals=8))
+            key_x = tuple(np.round(x, decimals=8))
+            vt = np.array(self.cache[key_t][:curr_n], dtype=np.float64)
+            vx = np.array(self.cache[key_x][:curr_n], dtype=np.float64)
+
+            diff = vt - vx
+            mean_diff = float(np.mean(diff))
+
+            # Case 1: Clearly worse or equal -> reject immediately without extra sampling
+            if mean_diff >= 0.0:
+                return False
+
+            # Case 2: Mean difference is negative (candidate looks promising)
+            if self.paired and curr_n > 1:
+                diff_std = float(np.std(diff, ddof=1))
+                if diff_std < 1e-12:
+                    return True
+                t_stat = mean_diff / (diff_std / np.sqrt(curr_n))
+                df = curr_n - 1
             else:
-                stat = float(mean_diff / (diff_std / np.sqrt(self._N)))
-            df = self._N - 1
-        else:
-            stat_res = stats.ttest_ind(vt, vx, equal_var=False)
-            stat = float(stat_res.statistic)
-            df = 2 * self._N - 2
+                stat_res = stats.ttest_ind(vt, vx, equal_var=False)
+                t_stat = float(stat_res.statistic)
+                df = 2 * curr_n - 2
 
-        if np.isnan(stat):
-            return mean_diff < 0.0 if type_ == "smaller" else True
+            p_val = float(stats.t.cdf(t_stat, df))
 
-        if type_ == "smaller":
-            # H0: mean(xtest) >= mean(x) vs H1: mean(xtest) < mean(x)
-            p_val = float(stats.t.cdf(stat, df))
-            return p_val < alpha
-        elif type_ == "equality":
-            # H0: mean(xtest) == mean(x)
-            p_val = float(2.0 * (1.0 - stats.t.cdf(abs(stat), df)))
-            return p_val > alpha
-        else:
-            raise ValueError(f"Unknown test type: {type_}")
+            # Case 2a: Statistically significant descent confirmed!
+            if p_val < alpha:
+                return True
+
+            # Case 2b: Inconclusive (mean is lower, but p-value >= alpha due to noise).
+            # Incrementally add samples ONLY for this comparison:
+            if curr_n + step_n <= self.max_n:
+                curr_n += step_n
+            else:
+                # Sample budget for this pair exhausted without reaching significance
+                return False
 
 
 def minimize_compass(
@@ -182,17 +167,18 @@ def minimize_compass(
     disp: bool = False,
     errorcontrol: bool = False,
     alpha: float = 0.05,
-    funcNinit: int = 10,
-    funcmultfactor: float = 2.0,
+    funcNinit: int = 8,
+    max_N: int = 60,
+    step_N: int = 4,
     paired: bool = True,
     **kwargs: Any,
 ) -> OptimizerResult:
-    """Pattern search / Compass search optimizer with optional adaptive stochastic error control.
+    """Pattern search / Compass search optimizer with optional on-demand stochastic error control.
 
     Parameters
     ----------
     func : callable
-        Objective function to minimize: f(x) -> float, or f(x, seed=int) -> float when errorcontrol=True.
+        Objective function: f(x) -> float, or f(x, seed=int) -> float when errorcontrol=True.
     x0 : sequence of float
         Initial parameter guess.
     bounds : sequence of (min, max), optional
@@ -202,7 +188,7 @@ def minimize_compass(
     deltatol : float, default 0.005
         Termination step size threshold.
     feps : float, default 0.0001
-        Minimum function improvement to accept a step.
+        Minimum function improvement to accept a step (used in deterministic mode).
     redfactor : float, default 2.0
         Reduction factor for step size when no descent direction is found.
     maxiter : int, default 200
@@ -210,14 +196,16 @@ def minimize_compass(
     disp : bool, default False
         Whether to print search progression.
     errorcontrol : bool, default False
-        If True, enables adaptive sample-size averaging and hypothesis testing to suppress
+        If True, enables on-demand sample-size averaging and hypothesis testing to suppress
         stochastic evaluation noise (e.g. mini-batch sampling, photon jitter, non-robust losses).
     alpha : float, default 0.05
-        Significance level for descent and equality hypothesis tests.
-    funcNinit : int, default 10
-        Initial sample repetitions per evaluation when errorcontrol=True.
-    funcmultfactor : float, default 2.0
-        Multiplier to increase sample repetitions when step descent lacks statistical power.
+        Significance level for descent tests.
+    funcNinit : int, default 8
+        Base sample count per candidate point.
+    max_N : int, default 60
+        Maximum sample repetitions allocated per inconclusive comparison.
+    step_N : int, default 4
+        Sample increment per undecided test step.
     paired : bool, default True
         If True, evaluates test candidates with identical random seeds for paired difference testing.
 
@@ -252,8 +240,13 @@ def minimize_compass(
     nit = 0
 
     if errorcontrol:
-        # Stochastic adaptive evaluation mode
-        funcm = AveragedFunction(func=func, N=funcNinit, paired=paired)
+        # On-demand stochastic evaluation mode
+        funcm = AveragedFunction(
+            func=func,
+            n_init=funcNinit,
+            max_n=max_N,
+            paired=paired,
+        )
         # Bonferroni correction for multi-directional search
         alpha_corr = alpha / len(directions)
 
@@ -267,7 +260,8 @@ def minimize_compass(
                 if np.allclose(x_test, x, atol=1e-12):
                     continue
 
-                if funcm.test(x_test, x, type_="smaller", alpha=alpha_corr):
+                # On-demand paired hypothesis testing: N expands ONLY if borderline
+                if funcm.compare_candidates(x_test, x, alpha=alpha_corr, step_n=step_N):
                     best_candidate = x_test
                     improved = True
                     break
@@ -275,38 +269,34 @@ def minimize_compass(
             if improved:
                 x = best_candidate
                 if disp:
-                    mean_f, se_f = funcm(x)
-                    print(f"[Compass-EC] iter={nit}, delta={delta:.4f}, x={x}, loss={mean_f:.6f}±{se_f:.6f}, N={funcm.N}")
+                    mean_f, se_f = funcm.evaluate(x)
+                    print(f"[Compass-EC] iter={nit}, delta={delta:.4f}, x={x}, loss={mean_f:.6f}±{se_f:.6f}")
             else:
-                # Test midpoint or increase sample repetitions
+                # Test midpoint along directions before step halving
                 mid_improved = False
                 for d in directions:
                     x_test = clip_point(x + delta * d)
                     x_mid = clip_point(0.5 * (x + x_test))
                     if np.allclose(x_mid, x, atol=1e-12):
                         continue
-                    if funcm.test(x_mid, x, type_="smaller", alpha=alpha_corr):
+                    if funcm.compare_candidates(x_mid, x, alpha=alpha_corr, step_n=step_N):
                         x = x_mid
                         delta = max(delta / redfactor, deltatol)
                         mid_improved = True
+                        if disp:
+                            print(f"[Compass-EC] Midpoint step accepted: delta={delta:.4f}, x={x}")
                         break
 
                 if not mid_improved:
-                    # Check if equality cannot be rejected due to high variance
-                    diff_se = funcm.diffse(x + delta * directions[0], x)
-                    if diff_se > feps and funcm.N < funcm.max_N:
-                        funcm.N = int(funcm.N * funcmultfactor)
-                        if disp:
-                            print(f"[Compass-EC] Increased sampling N to {funcm.N} (diff_se={diff_se:.5f})")
-                    else:
-                        delta /= redfactor
+                    delta /= redfactor
 
-        final_val, final_se = funcm(x)
+        final_val, final_se = funcm.evaluate(x)
         details = {
             "errorcontrol": True,
             "funse": float(final_se),
-            "final_N": int(funcm.N),
             "paired": bool(paired),
+            "n_init": int(funcNinit),
+            "max_N": int(max_N),
         }
         eval_count = funcm.nev
     else:

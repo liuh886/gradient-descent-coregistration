@@ -42,8 +42,7 @@ def test_compass_search_with_errorcontrol_on_noisy_function():
         deltainit=1.0,
         deltatol=0.02,
         errorcontrol=True,
-        funcNinit=15,
-        funcmultfactor=1.5,
+        funcNinit=8,
         paired=True,
     )
 
@@ -52,6 +51,8 @@ def test_compass_search_with_errorcontrol_on_noisy_function():
     assert res.details.get("errorcontrol") is True
     assert pytest.approx(target[0], abs=0.08) == res.x[0]
     assert pytest.approx(target[1], abs=0.08) == res.x[1]
+    # Verify N was expanded on-demand only (evaluations kept frugal, avoiding global blowout)
+    assert res.nfev < 600
 
 
 def test_scipy_lbfgsb_quadratic():
