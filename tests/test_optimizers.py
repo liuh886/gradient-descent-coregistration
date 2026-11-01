@@ -26,6 +26,34 @@ def test_compass_search_quadratic():
     assert res.fun < 0.001
 
 
+def test_compass_search_with_errorcontrol_on_noisy_function():
+    """Verify errorcontrol=True suppresses stochastic noise and converges to true minimum."""
+    target = np.array([1.2, -0.7])
+
+    def noisy_bowl(x, seed=0):
+        rng = np.random.default_rng(seed)
+        noise = rng.normal(0.0, 0.15)
+        return float(np.sum((x - target) ** 2) + noise)
+
+    res = minimize_compass(
+        func=noisy_bowl,
+        x0=[0.0, 0.0],
+        bounds=[(-3.0, 3.0), (-3.0, 3.0)],
+        deltainit=1.0,
+        deltatol=0.02,
+        errorcontrol=True,
+        funcNinit=15,
+        funcmultfactor=1.5,
+        paired=True,
+    )
+
+    assert res.success
+    assert "errorcontrol=True" in res.optimizer_name
+    assert res.details.get("errorcontrol") is True
+    assert pytest.approx(target[0], abs=0.08) == res.x[0]
+    assert pytest.approx(target[1], abs=0.08) == res.x[1]
+
+
 def test_scipy_lbfgsb_quadratic():
     target = np.array([1.2, -0.7])
 

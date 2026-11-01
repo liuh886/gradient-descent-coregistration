@@ -2,13 +2,14 @@
 
 Includes:
 - Compass Search (pattern search along coordinate directions, ideal for non-smooth/noisy objective functions)
+  with optional adaptive stochastic error control (`errorcontrol=True`).
 - SciPy-based optimizers (L-BFGS-B, Nelder-Mead, Powell)
 """
 
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
-from scipy import optimize
+from scipy import optimize, stats
 
 
 @dataclass
@@ -33,7 +34,140 @@ class OptimizerResult:
             "nit": int(self.nit),
             "nfev": int(self.nfev),
             "message": str(self.message),
+            "details": self.details or {},
         }
+
+
+class AveragedFunction:
+    """Manages adaptive stochastic evaluation and hypothesis testing for noisy objectives.
+
+    Inspired by the error-control mechanism of noisyopt, this class adaptively averages
+    repeated stochastic evaluations (or mini-batches) and uses paired/two-sample Student's
+    t-tests to confirm statistically significant descent directions.
+    """
+
+    def __init__(
+        self,
+        func: Callable[..., float],
+        N: int = 10,
+        paired: bool = True,
+        max_N: int = 200,
+        random_state: int = 42,
+    ):
+        self.func = func
+        self._N = max(2, int(N))
+        self.paired = paired
+        self.max_N = max_N
+        self.cache: Dict[Tuple[float, ...], List[float]] = {}
+        self.nev = 0
+        rng = np.random.default_rng(random_state)
+        self.seeds = list(rng.integers(0, 2**31 - 1, size=max_N))
+
+    @property
+    def N(self) -> int:
+        return self._N
+
+    @N.setter
+    def N(self, value: Union[int, float]):
+        self._N = min(max(2, int(value)), self.max_N)
+
+    def _call_func(self, pt: np.ndarray, seed: int) -> float:
+        try:
+            val = float(self.func(pt, seed=seed))
+        except TypeError:
+            try:
+                val = float(self.func(pt))
+            except Exception:
+                val = 1e12
+        return val if np.isfinite(val) else 1e12
+
+    def __call__(self, x: np.ndarray) -> Tuple[float, float]:
+        key = tuple(np.round(x, decimals=8))
+        if key not in self.cache:
+            self.cache[key] = []
+
+        curr_list = self.cache[key]
+        n_curr = len(curr_list)
+        if n_curr < self._N:
+            needed = self._N - n_curr
+            for i in range(needed):
+                seed = int(self.seeds[n_curr + i])
+                val = self._call_func(x, seed)
+                curr_list.append(val)
+                self.nev += 1
+
+        arr = np.array(curr_list[: self._N], dtype=np.float64)
+        mean_val = float(np.mean(arr))
+        se_val = float(np.std(arr, ddof=1) / np.sqrt(self._N)) if self._N > 1 else 0.0
+        return mean_val, se_val
+
+    def mean_only(self, x: np.ndarray) -> float:
+        return self(x)[0]
+
+    def diffse(self, x1: np.ndarray, x2: np.ndarray) -> float:
+        """Standard error of difference between function evaluations at x1 and x2."""
+        self(x1)
+        self(x2)
+        key1 = tuple(np.round(x1, decimals=8))
+        key2 = tuple(np.round(x2, decimals=8))
+        v1 = np.array(self.cache[key1][: self._N], dtype=np.float64)
+        v2 = np.array(self.cache[key2][: self._N], dtype=np.float64)
+        if self.paired and len(v1) == len(v2) and self._N > 1:
+            diff = v1 - v2
+            std_diff = np.std(diff, ddof=1)
+            return float(std_diff / np.sqrt(self._N))
+        else:
+            s1 = np.var(v1, ddof=1) if len(v1) > 1 else 0.0
+            s2 = np.var(v2, ddof=1) if len(v2) > 1 else 0.0
+            return float(np.sqrt(s1 / len(v1) + s2 / len(v2)))
+
+    def test(
+        self,
+        xtest: np.ndarray,
+        x: np.ndarray,
+        type_: str = "smaller",
+        alpha: float = 0.05,
+    ) -> bool:
+        """Hypothesis testing comparing xtest against x."""
+        self(xtest)
+        self(x)
+        key_t = tuple(np.round(xtest, decimals=8))
+        key_x = tuple(np.round(x, decimals=8))
+        vt = np.array(self.cache[key_t][: self._N], dtype=np.float64)
+        vx = np.array(self.cache[key_x][: self._N], dtype=np.float64)
+
+        diff = vt - vx
+        mean_diff = float(np.mean(diff))
+
+        if abs(mean_diff) < 1e-12:
+            return type_ == "equality"
+
+        if self.paired and self._N > 1:
+            diff_std = np.std(diff, ddof=1)
+            if diff_std < 1e-12:
+                # Virtually identical
+                stat = float("-inf" if mean_diff < 0 else "inf")
+            else:
+                stat = float(mean_diff / (diff_std / np.sqrt(self._N)))
+            df = self._N - 1
+        else:
+            stat_res = stats.ttest_ind(vt, vx, equal_var=False)
+            stat = float(stat_res.statistic)
+            df = 2 * self._N - 2
+
+        if np.isnan(stat):
+            return mean_diff < 0.0 if type_ == "smaller" else True
+
+        if type_ == "smaller":
+            # H0: mean(xtest) >= mean(x) vs H1: mean(xtest) < mean(x)
+            p_val = float(stats.t.cdf(stat, df))
+            return p_val < alpha
+        elif type_ == "equality":
+            # H0: mean(xtest) == mean(x)
+            p_val = float(2.0 * (1.0 - stats.t.cdf(abs(stat), df)))
+            return p_val > alpha
+        else:
+            raise ValueError(f"Unknown test type: {type_}")
 
 
 def minimize_compass(
@@ -46,16 +180,19 @@ def minimize_compass(
     redfactor: float = 2.0,
     maxiter: int = 200,
     disp: bool = False,
+    errorcontrol: bool = False,
+    alpha: float = 0.05,
+    funcNinit: int = 10,
+    funcmultfactor: float = 2.0,
+    paired: bool = True,
+    **kwargs: Any,
 ) -> OptimizerResult:
-    """Pattern search / Compass search optimizer.
-
-    Explores positive and negative steps along each coordinate direction.
-    Robust to minor discontinuities and local noise in sampled DEM residuals.
+    """Pattern search / Compass search optimizer with optional adaptive stochastic error control.
 
     Parameters
     ----------
     func : callable
-        Objective function to minimize: f(x) -> float.
+        Objective function to minimize: f(x) -> float, or f(x, seed=int) -> float when errorcontrol=True.
     x0 : sequence of float
         Initial parameter guess.
     bounds : sequence of (min, max), optional
@@ -72,6 +209,17 @@ def minimize_compass(
         Maximum iterations.
     disp : bool, default False
         Whether to print search progression.
+    errorcontrol : bool, default False
+        If True, enables adaptive sample-size averaging and hypothesis testing to suppress
+        stochastic evaluation noise (e.g. mini-batch sampling, photon jitter, non-robust losses).
+    alpha : float, default 0.05
+        Significance level for descent and equality hypothesis tests.
+    funcNinit : int, default 10
+        Initial sample repetitions per evaluation when errorcontrol=True.
+    funcmultfactor : float, default 2.0
+        Multiplier to increase sample repetitions when step descent lacks statistical power.
+    paired : bool, default True
+        If True, evaluates test candidates with identical random seeds for paired difference testing.
 
     Returns
     -------
@@ -86,28 +234,10 @@ def minimize_compass(
     else:
         b_arr = None
 
-    cache: Dict[Tuple[float, ...], float] = {}
-    eval_count = 0
-
-    def evaluate(pt: np.ndarray) -> float:
-        nonlocal eval_count
-        key = tuple(np.round(pt, decimals=8))
-        if key not in cache:
-            eval_count += 1
-            val = float(func(pt))
-            if np.isnan(val):
-                val = 1e12
-            cache[key] = val
-        return cache[key]
-
     def clip_point(pt: np.ndarray) -> np.ndarray:
         if b_arr is not None:
             return np.clip(pt, b_arr[:, 0], b_arr[:, 1])
         return pt
-
-    current_val = evaluate(x)
-    delta = float(deltainit)
-    nit = 0
 
     # Direction vectors: +e_i, -e_i for each dimension
     directions: List[np.ndarray] = []
@@ -118,55 +248,142 @@ def minimize_compass(
         d_neg[i] = -1.0
         directions.extend([d_pos, d_neg])
 
-    while delta >= deltatol and nit < maxiter:
-        nit += 1
-        improved = False
-        best_candidate = x.copy()
-        best_candidate_val = current_val
+    delta = float(deltainit)
+    nit = 0
 
-        for d in directions:
-            x_test = clip_point(x + delta * d)
-            if np.allclose(x_test, x, atol=1e-12):
-                continue
-            val_test = evaluate(x_test)
-            if val_test < (best_candidate_val - feps):
-                best_candidate = x_test
-                best_candidate_val = val_test
-                improved = True
+    if errorcontrol:
+        # Stochastic adaptive evaluation mode
+        funcm = AveragedFunction(func=func, N=funcNinit, paired=paired)
+        # Bonferroni correction for multi-directional search
+        alpha_corr = alpha / len(directions)
 
-        if improved:
-            x = best_candidate
-            current_val = best_candidate_val
-            if disp:
-                print(f"[Compass] iter={nit}, delta={delta:.4f}, x={x}, loss={current_val:.6f}")
-        else:
-            # Check midpoint test along coordinate directions before shrinking
-            mid_improved = False
+        while delta >= deltatol and nit < maxiter:
+            nit += 1
+            improved = False
+            best_candidate = x.copy()
+
             for d in directions:
                 x_test = clip_point(x + delta * d)
-                x_mid = clip_point(0.5 * (x + x_test))
-                if np.allclose(x_mid, x, atol=1e-12):
+                if np.allclose(x_test, x, atol=1e-12):
                     continue
-                val_mid = evaluate(x_mid)
-                if val_mid < (current_val - feps):
-                    x = x_mid
-                    current_val = val_mid
-                    delta = max(delta / redfactor, deltatol)
-                    mid_improved = True
+
+                if funcm.test(x_test, x, type_="smaller", alpha=alpha_corr):
+                    best_candidate = x_test
+                    improved = True
                     break
 
-            if not mid_improved:
-                delta /= redfactor
+            if improved:
+                x = best_candidate
+                if disp:
+                    mean_f, se_f = funcm(x)
+                    print(f"[Compass-EC] iter={nit}, delta={delta:.4f}, x={x}, loss={mean_f:.6f}±{se_f:.6f}, N={funcm.N}")
+            else:
+                # Test midpoint or increase sample repetitions
+                mid_improved = False
+                for d in directions:
+                    x_test = clip_point(x + delta * d)
+                    x_mid = clip_point(0.5 * (x + x_test))
+                    if np.allclose(x_mid, x, atol=1e-12):
+                        continue
+                    if funcm.test(x_mid, x, type_="smaller", alpha=alpha_corr):
+                        x = x_mid
+                        delta = max(delta / redfactor, deltatol)
+                        mid_improved = True
+                        break
+
+                if not mid_improved:
+                    # Check if equality cannot be rejected due to high variance
+                    diff_se = funcm.diffse(x + delta * directions[0], x)
+                    if diff_se > feps and funcm.N < funcm.max_N:
+                        funcm.N = int(funcm.N * funcmultfactor)
+                        if disp:
+                            print(f"[Compass-EC] Increased sampling N to {funcm.N} (diff_se={diff_se:.5f})")
+                    else:
+                        delta /= redfactor
+
+        final_val, final_se = funcm(x)
+        details = {
+            "errorcontrol": True,
+            "funse": float(final_se),
+            "final_N": int(funcm.N),
+            "paired": bool(paired),
+        }
+        eval_count = funcm.nev
+    else:
+        # Standard deterministic evaluation mode (fast path)
+        cache: Dict[Tuple[float, ...], float] = {}
+        eval_count = 0
+
+        def evaluate(pt: np.ndarray) -> float:
+            nonlocal eval_count
+            key = tuple(np.round(pt, decimals=8))
+            if key not in cache:
+                eval_count += 1
+                try:
+                    val = float(func(pt))
+                except TypeError:
+                    val = float(func(pt, seed=0))
+                if np.isnan(val):
+                    val = 1e12
+                cache[key] = val
+            return cache[key]
+
+        current_val = evaluate(x)
+
+        while delta >= deltatol and nit < maxiter:
+            nit += 1
+            improved = False
+            best_candidate = x.copy()
+            best_candidate_val = current_val
+
+            for d in directions:
+                x_test = clip_point(x + delta * d)
+                if np.allclose(x_test, x, atol=1e-12):
+                    continue
+                val_test = evaluate(x_test)
+                if val_test < (best_candidate_val - feps):
+                    best_candidate = x_test
+                    best_candidate_val = val_test
+                    improved = True
+
+            if improved:
+                x = best_candidate
+                current_val = best_candidate_val
+                if disp:
+                    print(f"[Compass] iter={nit}, delta={delta:.4f}, x={x}, loss={current_val:.6f}")
+            else:
+                mid_improved = False
+                for d in directions:
+                    x_test = clip_point(x + delta * d)
+                    x_mid = clip_point(0.5 * (x + x_test))
+                    if np.allclose(x_mid, x, atol=1e-12):
+                        continue
+                    val_mid = evaluate(x_mid)
+                    if val_mid < (current_val - feps):
+                        x = x_mid
+                        current_val = val_mid
+                        delta = max(delta / redfactor, deltatol)
+                        mid_improved = True
+                        break
+
+                if not mid_improved:
+                    delta /= redfactor
+
+        final_val = current_val
+        details = {"errorcontrol": False}
 
     success = delta < deltatol or nit < maxiter
+    opt_label = "compass_search(errorcontrol=True)" if errorcontrol else "compass_search"
+
     return OptimizerResult(
         x=x,
-        fun=current_val,
-        optimizer_name="compass_search",
+        fun=final_val,
+        optimizer_name=opt_label,
         success=success,
         nit=nit,
         nfev=eval_count,
         message=f"Terminated with final step delta={delta:.6f}",
+        details=details,
     )
 
 
@@ -191,7 +408,10 @@ def minimize_scipy(
     def wrapped_func(x_pt: np.ndarray) -> float:
         nonlocal eval_count
         eval_count += 1
-        val = float(func(x_pt))
+        try:
+            val = float(func(x_pt))
+        except TypeError:
+            val = float(func(x_pt, seed=0))
         if np.isnan(val):
             return 1e12
         return val
@@ -205,7 +425,6 @@ def minimize_scipy(
     )
 
     fun_val = float(res.fun)
-    # Consider successful if standard success is true, or loss is already near zero
     is_success = bool(res.success or fun_val < 1e-4)
 
     return OptimizerResult(
@@ -226,9 +445,10 @@ def run_optimizer(
     optimizer: str = "lbfgsb",
     bounds: Optional[Sequence[Tuple[float, float]]] = None,
     disp: bool = False,
+    errorcontrol: bool = False,
     **kwargs: Any,
 ) -> OptimizerResult:
-    """Dispatcher for running either compass or scipy optimization."""
+    """Dispatcher for running either compass (with optional errorcontrol) or scipy optimization."""
     opt_norm = optimizer.strip().lower().replace("-", "").replace("_", "")
     if opt_norm in {"compass", "compasssearch", "pattern"}:
         return minimize_compass(
@@ -236,7 +456,8 @@ def run_optimizer(
             x0=x0,
             bounds=bounds,
             disp=disp,
-            **{k: v for k, v in kwargs.items() if k in {"deltainit", "deltatol", "feps", "redfactor", "maxiter"}},
+            errorcontrol=errorcontrol,
+            **kwargs,
         )
     elif opt_norm in {"lbfgsb", "lbfgs", "scipylbfgsb"}:
         return minimize_scipy(func=func, x0=x0, method="L-BFGS-B", bounds=bounds, disp=disp, options=kwargs)

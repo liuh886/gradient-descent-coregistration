@@ -93,6 +93,8 @@ def coreg_points_to_dem(
     nodata: Optional[float] = None,
     mask: Optional[np.ndarray] = None,
     disp: bool = False,
+    errorcontrol: bool = False,
+    batch_size: Optional[int] = None,
     **optimizer_kwargs: Any,
 ) -> CoregResult:
     """Core function to find optimal translation (dx, dy, dz) between points and a DEM.
@@ -195,14 +197,27 @@ def coreg_points_to_dem(
         raise ValueError(f"Unknown loss '{loss}'. Supported: 'nmad', 'rmse', 'mix'.")
 
     # Objective function
-    def objective_func(p_px: np.ndarray) -> float:
+    def objective_func(p_px: np.ndarray, seed: Optional[int] = None) -> float:
         dx_px_curr, dy_px_curr = p_px[0], p_px[1]
         shift_x = dx_px_curr * res_x
         shift_y = dy_px_curr * res_y
 
+        if batch_size is not None and batch_size < n_points:
+            rng_b = np.random.default_rng(seed if seed is not None else random_state)
+            sub_idx = rng_b.choice(n_points, size=batch_size, replace=False)
+            x_curr = x_full[sub_idx]
+            y_curr = y_full[sub_idx]
+            z_curr = z_full[sub_idx]
+            w_curr = weights[sub_idx] if weights is not None else None
+        else:
+            x_curr = x_opt
+            y_curr = y_opt
+            z_curr = z_opt
+            w_curr = weights_opt
+
         # Shift points
-        x_shifted = x_opt + shift_x
-        y_shifted = y_opt + shift_y
+        x_shifted = x_curr + shift_x
+        y_shifted = y_curr + shift_y
 
         z_dem = sample_grid_at_coordinates(
             grid=dem_grid,
@@ -215,9 +230,9 @@ def coreg_points_to_dem(
             area_or_point=area_or_point,
         )
 
-        dh = z_opt - z_dem
-        if weights_opt is not None:
-            dh = dh * weights_opt
+        dh = z_curr - z_dem
+        if w_curr is not None:
+            dh = dh * w_curr
 
         filtered_dh, _ = filter_outliers(dh, perc_t=perc_t, d_lim=d_lim, std_t=std_t)
         if filtered_dh.size < 5:
@@ -233,6 +248,7 @@ def coreg_points_to_dem(
         optimizer=optimizer,
         bounds=b_tuples,
         disp=disp,
+        errorcontrol=errorcontrol,
         **optimizer_kwargs,
     )
 

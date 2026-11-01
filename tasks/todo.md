@@ -18,17 +18,23 @@
 - [x] Phase 5: 文档与发布准备
   - [x] 编写核心 API 说明与 Quickstart 示例
   - [x] 整理证据表与 README
+- [x] Phase 6: 强化功能 - 补齐 `noisyopt` 统计误差控制与随机采样加速
+  - [x] 实现 `AveragedFunction` 动态样本平均与成对假设检验（Paired Student's t-test）
+  - [x] `minimize_compass` 支持 `errorcontrol=True` 选项与自适应抽样
+  - [x] 配准引擎支持 `batch_size` 随机 Mini-batch 评估，解决大样本计算压力
+  - [x] 补充单测（带随机高斯噪声目标函数收敛测试与 Mini-batch 配准测试）
 
 ---
 
 ## Review & Verification Summary
 
 1. **测试套件状态**：
-   - 运行 27 个单元与基准测试，全部 26 个通过（1 个由于系统环境 pyproj 二进制环境问题优雅跳过）。
-   - 执行时间：~3.5 秒。
+   - 运行 29 个单元与基准测试，全部 28 个通过（1 个由于系统环境 pyproj 二进制环境问题优雅跳过）。
+   - 执行时间：~4.7 秒。
 2. **基准重现与精度**：
    - 在合成 DTM10（已知位移 $dx=1.2\text{ px}, dy=-0.7\text{ px}, dz=0.16\text{ m}$）测试中，GDC 能够精确收敛并 100% 找回真值参数（误差 < 0.005 px）。
-   - 在 200、500、1000、2000 稀疏点梯度实验中，验证了样本量与收敛稳定性的关系，并在高层质检中实现了对应的置信度分档规则。
+   - 针对带显著随机扰动（$\sigma = 0.15$）的目标函数，`errorcontrol=True` 能通过成对统计检验成功过滤噪声，准确收敛至真实极值点。
+   - 实现了 Mini-batch 抽样下的统计收敛，为大点云配准提供了无需退回 NuthKaab 的极速备选方案。
 3. **架构约束对齐**：
-   - 核心库 `gdc.core` 仅依赖 NumPy 和 SciPy，无任何强制性 GIS 重型依赖。
-   - 所有输入数据均保持只读，不修改原对象，统一返回结构化报告与计算副本。
+   - 保持完全向后兼容，默认 `errorcontrol=False`（零性能开销）；
+   - 核心库 `gdc.core` 仅依赖 NumPy 和 SciPy，无任何外部额外依赖。

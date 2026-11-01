@@ -1,6 +1,6 @@
 # Gradient Descent Coregistration (GDC)
 
-[![CI](https://img.shields.io/badge/tests-26%20passed-brightgreen.svg)]()
+[![CI](https://img.shields.io/badge/tests-28%20passed-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python: 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)]()
 
@@ -24,6 +24,7 @@ Instead of resampling the full DEM raster on each iteration, GDC shifts the 3D p
 - **Point-to-surface translation search**: Shifts coordinates $(x, y)$, never resamples raster grids on intermediate steps.
 - **Dependency-light core**: Core registration algorithms depend strictly on **NumPy** and **SciPy**.
 - **Transparent optimization**: Records the exact optimizer used (`compass_search`, `scipy_l-bfgs-b`, etc.) with iteration counts and evaluation counts.
+- **Adaptive stochastic error control (`errorcontrol=True`)**: Optional noisyopt-style adaptive sample averaging and paired t-tests to suppress random evaluation jitter when optimizing noisy losses, mini-batches, or highly sparse point subsets.
 - **Robust loss metrics**: Normalized Median Absolute Deviation (`nmad`), Root Mean Square Error (`rmse`), and mixed loss `mix = (2 * nmad + rmse) / 3`.
 - **Quality Control (QC) Tier classification**: Classifies validation runs into `reliable`, `cautious`, or `unreliable` tiers based on sample size, convergence stability, boundary constraints, and residual reduction.
 - **Machine-readable JSON reports**: Produces structured JSON output for direct integration into automated geospatial pipelines.

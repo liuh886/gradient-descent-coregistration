@@ -27,6 +27,8 @@ def check_dem(
     std_t: Optional[float] = None,
     area_or_point: str = "Area",
     disp: bool = False,
+    errorcontrol: bool = False,
+    batch_size: Optional[int] = None,
     metadata: Optional[Dict[str, Any]] = None,
     **optimizer_kwargs: Any,
 ) -> QCReport:
@@ -134,6 +136,8 @@ def check_dem(
         area_or_point=area_or_point,
         nodata=dem_adapter.nodata,
         disp=disp,
+        errorcontrol=errorcontrol,
+        batch_size=batch_size,
         **optimizer_kwargs,
     )
 

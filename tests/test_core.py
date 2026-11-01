@@ -116,3 +116,52 @@ def test_coreg_recovers_known_shift_compass(synthetic_terrain):
     assert pytest.approx(true_dx_px, abs=0.15) == result.dx_px
     assert pytest.approx(true_dy_px, abs=0.15) == result.dy_px
     assert pytest.approx(true_dz, abs=0.10) == result.dz_m
+
+
+def test_coreg_with_minibatch_and_errorcontrol(synthetic_terrain):
+    """Verify stochastic mini-batch coregistration with errorcontrol=True."""
+    grid, trans = synthetic_terrain
+    res = 10.0
+
+    true_dx_px = 1.0
+    true_dy_px = -0.5
+    true_dz = 0.20
+
+    true_dx_m = true_dx_px * res
+    true_dy_m = true_dy_px * res
+
+    rng = np.random.default_rng(777)
+    n_pts = 1500
+    x_pts = rng.uniform(10200.0, 11000.0, n_pts)
+    y_pts = rng.uniform(50200.0, 51000.0, n_pts)
+
+    from gdc.core.sampling import sample_grid_at_coordinates
+
+    z_dem_at_true_pos = sample_grid_at_coordinates(
+        grid, trans, x_pts + true_dx_m, y_pts + true_dy_m, order=3
+    )
+    z_pts = z_dem_at_true_pos + true_dz
+
+    # Use mini-batch of 300 points out of 1500, with errorcontrol=True
+    result = coreg_points_to_dem(
+        x=x_pts,
+        y=y_pts,
+        z=z_pts,
+        dem_grid=grid,
+        transform=trans,
+        optimizer="compass",
+        bounds_px=(-3.0, 3.0),
+        deltainit=0.8,
+        deltatol=0.03,
+        errorcontrol=True,
+        batch_size=300,
+        funcNinit=8,
+        interpolation_order=1,
+    )
+
+    assert result.optimizer_result.success
+    assert "errorcontrol=True" in result.optimizer_name
+    assert pytest.approx(true_dx_px, abs=0.15) == result.dx_px
+    assert pytest.approx(true_dy_px, abs=0.15) == result.dy_px
+    assert pytest.approx(true_dz, abs=0.10) == result.dz_m
+
