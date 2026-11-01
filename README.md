@@ -10,6 +10,13 @@ GDC is a point-to-surface coregistration and quality control library designed fo
 
 Instead of resampling the full DEM raster on each iteration, GDC shifts the 3D points, samples the DEM at the shifted positions, and minimizes robust statistics of the elevation differences ($dh$).
 
+<p align="center">
+  <img src="docs/images/gdc_error_surface.png" alt="DEM Coregistration 3D Error Surface & Convergence" width="95%">
+</p>
+<p align="center">
+  <em>Figure 1: Coregistration formulated as an optimization problem on the 3D residual error surface (NMAD, RMSE, STD). GDC iteratively searches parameter space to converge to the global minimum (dx, dy) without resampling the underlying raster.</em>
+</p>
+
 ---
 
 ## Key Features
@@ -114,6 +121,13 @@ On a synthetic 10m DEM with known true displacement:
 | **2,000** | $1.201$ | $-0.700$ | $0.160$ | $0.049$ | True parameter recovery |
 
 *All benchmark tests are part of the automated continuous test suite (`tests/test_synthetic_benchmark.py`).*
+
+<p align="center">
+  <img src="docs/images/gdc_difference_map.png" alt="Spatial Elevation Difference (dH) Maps and Histograms" width="95%">
+</p>
+<p align="center">
+  <em>Figure 2: Spatial elevation difference (dH) maps and residual distribution comparisons across coregistration methods (NuthKaab vs GDC vs Raw). GDC achieves robust convergence in seconds even on fine-resolution terrains.</em>
+</p>
 
 ---
 
