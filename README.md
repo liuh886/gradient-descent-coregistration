@@ -159,7 +159,7 @@ The optimiser choice is part of the method, not an implementation detail. Biline
 
 ## Provenance
 
-Originally developed inside the `xsnow` package of [liuh886/subgrid_snow](https://github.com/liuh886/subgrid_snow). This repository is the standalone, decoupled implementation of GDC.
+Originally developed inside the `xsnow` package of [liuh886/subgrid_snow](https://github.com/liuh886/subgrid_snow). An early implementation was contributed to [GlacioHack/xdem](https://github.com/GlacioHack/xdem) as the `GradientDescending` coregistration class ([PR #346](https://github.com/GlacioHack/xdem/pull/346), merged 2023-06-13; refactored and renamed `DhMinimize` in 2024). This repository is the standalone, decoupled implementation of GDC, maintained by the original author.
 
 ## License
 
