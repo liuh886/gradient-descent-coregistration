@@ -140,6 +140,14 @@ On a synthetic 10m DEM with known true displacement:
 
 ---
 
+## Origin: the problem was framed here first
+
+GDC is where DEM coregistration — in particular, coregistration of a DEM against sparse ICESat-2 altimetry — was first formulated as an optimisation problem: minimise a robust point-to-surface residual statistic (NMAD of $dh$) directly over the translation parameters $(dx, dy, dz)$. This replaces the classical routes — deriving the shift from slope–aspect geometry (Nuth & Kääb, 2011) or from point-to-point correspondence (ICP) — with a single objective whose converged residual distribution is itself the accuracy statement: the median is the systematic bias, and the NMAD is the random noise level. The formulation was published in 2023 ([method comparison](https://zhihaol.eu.org/blog/2023/gdc/), [DEM–ICESat-2 study](https://zhihaol.eu.org/blog/2023/dataset/)) and underlies a peer-reviewed snow-depth study ([DOI: 10.1016/j.coldregions.2025.104580](https://doi.org/10.1016/j.coldregions.2025.104580)).
+
+The optimiser choice is part of the method, not an implementation detail. Bilinear sampling and a median-based statistic make the objective piecewise and non-smooth, so a generic gradient-based optimiser (e.g. SciPy's L-BFGS-B) spends most of its evaluations on finite-difference gradients that do not exist at the kinks. A derivative-free compass (pattern) search needs only function-value comparisons, and on identical objectives it reaches the same minimum with about 4× fewer evaluations (60 vs 255 at 1,000 points; 62 vs 360 at 20,000 points — evaluation counts are hardware-independent, unlike wall-clock times). For sparse-point DEM–ICESat-2 coregistration — the regime where NuthKaab slows down sharply or fails at fine resolutions and small sample sizes — this formulation, with its matched optimiser, is the best solution we know of, and the one this repository maintains.
+
+---
+
 ## Background & Citations
 
 - **Method Comparison**: NuthKaab vs Gradient Descent, point interpolation vs footprint zonal stats: <https://zhihaol.eu.org/blog/2023/gdc/>
